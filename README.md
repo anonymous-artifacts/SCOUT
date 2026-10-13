@@ -6,9 +6,9 @@ This repository maintains four problems with the same storage-resident engine:
 
 | Problem | Source | Repair |
 |---|---|---|
-| `mis` — maximal independent set | `src/mis/scout_mis.cu` | LCL, fixed 2-hop repair region; CPU fetch of batch *K+1* overlaps the GPU repair of batch *K* |
-| `coloring` — graph coloring | `src/coloring/scout_coloring.cu` | LCL, fixed 1-hop repair region |
-| `bfs` — breadth-first search levels | `src/bfs/scout_bfs.cu` | non-LCL, adaptive repair of the affected subtrees |
+| `mis` — maximal independent set | `src/mis/scout_mis.cu` | LCL, radius K = 2: vertex-disjoint 2-hop regions repaired one per GPU thread; batch *k+1* is fetched and packed while batch *k* is repaired |
+| `coloring` — graph coloring | `src/coloring/scout_coloring.cu` | LCL, radius K = 1: vertex-disjoint 1-hop regions repaired one per GPU thread; batch *k+1* is recorded and prefetched while batch *k* is repaired |
+| `bfs` — breadth-first search levels | `src/bfs/scout_bfs.cu` | non-LCL, adaptive search over the vertices whose level changed |
 | `cc` — connected components | `src/cc/scout_cc.cu` | non-LCL, adaptive bidirectional search on each deletion |
 
 All four read the same `.egr` binary CSR graph format and the same batch-folder format, and are invoked with the same 5 positional arguments (see [Running](#running)).
@@ -69,7 +69,7 @@ Against your own graph and batch stream:
 - `--num-batches` —> how many of those batch files to actually replay. Defaults to the number of `*.mtx` files found in `--batch` if omitted.
 - `--gpu` —> CUDA device ID to run on. Defaults to `0`.
 
-Run `./run.sh --help` for the full flag reference, including the `NVCC`, `SCOUT_ARCH_FLAG`, and `SCOUT_SKIP_COMPACTION` environment overrides.
+Run `./run.sh --help` for the full flag reference, including the `NVCC` and `SCOUT_ARCH_FLAG` build overrides and the runtime switches listed under [Runtime switches](#runtime-switches).
 
 You can also invoke any built binary directly, without `run.sh`, using the same 5 positional arguments:
 
@@ -78,6 +78,38 @@ bin/scout_<problem> <graph.egr> <initial_state.txt> <batch_folder> <num_batches>
 ```
 
 Each run prints one line per batch and a final summary with the end-to-end time and the size of the maintained solution.
+
+## Runtime switches
+
+All are environment variables; the defaults are the configuration used in the paper.
+
+| Variable | Effect |
+|---|---|
+| `SCOUT_FETCH_THREADS=T` | number of fetch workers T (default: min(cores, 64)) |
+| `SCOUT_NO_MEMO=1` | disable the batch-local memo of fetched lists |
+| `SCOUT_MEMO_MAX_BYTES=N` | evict the memo when it grows past N bytes |
+| `SCOUT_NO_MADV_RANDOM=1` | keep the kernel's readahead on the mapped graph |
+| `SCOUT_NO_OVERLAP=1` | `mis`, `coloring`: no CPU/GPU overlap across batches |
+| `SCOUT_BUDGET=count\|unbounded\|mem:<bytes>` | `bfs`, `cc`: search budget (default `count`) |
+| `SCOUT_BFS_BOUND=b` | `bfs`: count bound b (default 200); `cc` uses 5000, or unbounded when the average degree is below 10 |
+| `SCOUT_DEFER_FALLBACK=0` | `bfs`, `cc`: recompute at once when a search exceeds its budget, instead of once after the stream |
+| `SCOUT_SKIP_COMPACTION=1` | `mis`: do not merge the scratchpad into the `.egr` at the end of the run (always set by `--sample`) |
+| `SCOUT_VALIDATE=1` | `mis`, `coloring`: check the final solution against the final graph |
+| `SCOUT_DUMP_TOUCHED=<file>` | write the ids of all fetched vertices, for the page bound of Eq. (3) |
+
+Each batch prints a `[STAGE]` line (fetch, seed/pack, H2D, repair, commit times) and a `[FETCH]` line: `pages` is the size of the batch's page set, `faulted` the pages read from storage during the batch (major faults), `lists` the lists reconciled, and `memo_hits` the requests served by the memo.
+
+## How the code maps to the paper
+
+| Paper | Code |
+|---|---|
+| Storage-resident CSR, scratchpad Δ, Eq. (1) | `core/FlashGraph.h`: `FlashGraph`, `DeltaOverlay`, `HybridGraph` |
+| FetchFrontier, Alg. 1 (memo, page set of Eq. 2, T disjoint workers, reconcile) | `core/fetch.h`: `fetch_frontier` |
+| Problem interface (SEED, K, REPAIR, π, COMMIT; SELECT, RESOLVED) | `core/problem.h` |
+| SCOUT_LCL, Alg. 2 (K rounds, MergeOverlap, pack, region repair) | `core/lcl_driver.h`, with `src/mis` and `src/coloring` |
+| SCOUT_NL, Alg. 3 (in-order updates, WithinBudget, fallback) | `core/nl_driver.h`, `core/local_repair.h`, with `src/bfs` and `src/cc` |
+| Asynchronous CPU–GPU pipeline, Fig. 7 | `LclDriver::run` in `core/lcl_driver.h` |
+| Transfer: zero-copy on integrated GPUs, pinned copies otherwise | `core/gpu_common.h` |
 
 ## Using your own graph
 
@@ -148,15 +180,18 @@ SCOUT/
 │   ├── coloring/scout_coloring.cu    # graph coloring
 │   ├── bfs/scout_bfs.cu              # breadth-first search
 │   └── cc/scout_cc.cu                # connected components
-├── core/                     # shared headers used by all four binaries
-│   ├── FlashGraph.h          # mmap-backed .egr reader + update scratchpad
+├── core/                     # the runtime, shared by all four binaries
+│   ├── FlashGraph.h          # mmap-backed .egr reader + update scratchpad + memo
+│   ├── fetch.h               # FetchFrontier: page-granular fetch engine (Alg. 1)
+│   ├── problem.h             # problem interface and search budget
+│   ├── lcl_driver.h          # LCL maintenance (Alg. 2) and the CPU-GPU pipeline
+│   ├── nl_driver.h           # non-LCL maintenance (Alg. 3)
+│   ├── local_repair.h        # search bound and deferral policy (bfs, cc)
 │   ├── flash_compactor.h     # end-of-run base+scratchpad -> fresh .egr merge
 │   ├── gpu_common.h          # CUDA_CHECK, device setup, buffer allocation
 │   ├── cli_setup.h           # argument parsing, batch/initial-state file I/O
 │   ├── reporting.h           # standardized console output
-│   ├── round_buffer.h        # per-round GPU buffers (bfs, coloring)
-│   ├── chunking.h            # bounded-degree round chunking
-│   └── local_repair.h        # search bound and deferral policy (bfs, cc)
+│   └── round_buffer.h        # per-round GPU scalar helpers (bfs)
 ├── tools/                    # graph conversion / batch / initial-state utilities
 ├── datasets/sample/          # small bundled graph, initial states, and batches
 └── bin/                      # build output (created by run.sh / nvcc)

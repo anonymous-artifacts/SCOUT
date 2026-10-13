@@ -1,17 +1,5 @@
-// SCOUT: dynamic BFS (non-LCL problem) on a storage-resident graph.
-//
-// The base graph is a memory-mapped CSR (.egr) and updates are kept in an in-memory
-// scratchpad (core/FlashGraph.h). Each batch of edge insertions/deletions is repaired
-// locally: affected frontiers are fetched on the CPU, packed, and relaxed on the GPU in
-// rounds. A deletion whose repair grows past the bound b (default 200 vertices,
-// SCOUT_BFS_BOUND) is deferred and resolved by one full traversal after the stream.
-//
-// Usage: scout_bfs <graph.egr> <initial_bfs.txt> <batch_dir> <num_batches> <gpu_id>
-//   initial_bfs.txt: "vertex level" per line (1-indexed vertex ids)
-//   batch_dir:       1.mtx, 2.mtx, ... with "u v" per line (1-indexed); an edge is inserted
-//                    if absent and deleted if present
-// Environment: SCOUT_BFS_BOUND, SCOUT_DEFER_FALLBACK=0 (repair each deferred deletion
-//   immediately), SCOUT_NO_MEMO, SCOUT_NO_MADV_RANDOM, SCOUT_DUMP_TOUCHED=<file>.
+// SCOUT BFS (non-LCL) on the NL driver. Each round expands the vertices whose level changed;
+// a deletion past the budget is deferred to one full traversal after the stream.
 
 #include <cuda_runtime.h>
 #include <iostream>
@@ -28,20 +16,20 @@
 #include "../../core/gpu_common.h"
 #include "../../core/cli_setup.h"
 #include "../../core/round_buffer.h"
-#include "../../core/chunking.h"
 #include "../../core/local_repair.h"
 #include "../../core/reporting.h"
+#include "../../core/fetch.h"
+#include "../../core/nl_driver.h"
 
 using namespace std;
-// CUDA_CHECK now comes from core/gpu_common.h -- no longer defined here.
 
 const int UNREACHED = -1;
 #define THREADS_PER_BLOCK 256
 #define MAX_ROUND_FRONTIER 200000
 #define MAX_ROUND_CSR_ELEMS 20000000
 
-static bool g_integrated = false;  // set in main() from cudaDeviceProp.integrated
-static bool g_defer_fallback = true; // production default; SCOUT_DEFER_FALLBACK=0 to compare against old per-event immediate fallback
+static bool g_integrated = false;
+static bool g_defer_fallback = true;
 
 __device__ inline bool gpu_relax(int* level_ptr, int candidate) {
     int old = *level_ptr;
@@ -130,11 +118,11 @@ struct BfsRoundBuffers {
     int* h_level_view;
     int num_nodes;
 
-    int* h_next_count;  // pinned/mapped single-int landing spot for the round's next_count read-back
+    int* h_next_count;
 
     template <typename T>
     void alloc_pair(T** h_ptr, T** d_ptr, size_t count) {
-        ::alloc_pair(h_ptr, d_ptr, count, g_integrated); // core/gpu_common.h
+        ::alloc_pair(h_ptr, d_ptr, count, g_integrated);
     }
 
     void init(int n) {
@@ -144,12 +132,12 @@ struct BfsRoundBuffers {
         alloc_pair(&h_offsets, &d_offsets, (size_t)(MAX_ROUND_FRONTIER + 1));
         alloc_pair(&h_elems, &d_elems, (size_t)MAX_ROUND_CSR_ELEMS);
         alloc_pair(&h_next_ids, &d_next_ids, (size_t)MAX_ROUND_FRONTIER);
-        alloc_pair(&h_next_levels, &d_gather_out, (size_t)MAX_ROUND_FRONTIER); // reuse d_gather_out as the device side of h_next_levels
-        int* dummy_h; // new_level_out has no CPU-write role, only device-write + host-read
+        alloc_pair(&h_next_levels, &d_gather_out, (size_t)MAX_ROUND_FRONTIER);
+        int* dummy_h;
         alloc_pair(&dummy_h, &d_new_levels, (size_t)MAX_ROUND_FRONTIER);
         int* dummy_h2;
         alloc_pair(&dummy_h2, &d_next_count, (size_t)1);
-        h_next_count = dummy_h2;  // when integrated this aliases d_next_count; when discrete it's a plain pinned int
+        h_next_count = dummy_h2;
 
         if (g_integrated) {
             CUDA_CHECK(cudaHostAlloc(&h_level_view, (size_t)num_nodes * sizeof(int), cudaHostAllocMapped));
@@ -160,13 +148,12 @@ struct BfsRoundBuffers {
         }
     }
 
-    // core/round_buffer.h -- shared with coloring's retry_count round-trip.
     void reset_next_count() { reset_scalar_count(d_next_count, h_next_count, g_integrated); }
     int read_next_count() { return read_scalar_count_back(d_next_count, h_next_count, g_integrated); }
 };
 
 static double g_transfer_ms = 0, g_kernel_ms = 0;
-static double g_fetch_ms = 0, g_commit_ms = 0;  // eval stage breakdown (core/reporting.h print_stage_times)
+static double g_commit_ms = 0;
 
 static void time_event_pair(cudaEvent_t a, cudaEvent_t b, double& accum) {
     float ms = 0;
@@ -174,38 +161,14 @@ static void time_event_pair(cudaEvent_t a, cudaEvent_t b, double& accum) {
     accum += ms;
 }
 
-static vector<int> gpu_relax_round(HybridGraph& graph, vector<int>& level,
-                                    BfsRoundBuffers& buf, vector<int>& frontier,
-                                    long long& touched_out, size_t* consumed_out = nullptr,
+// One GPU round over a frontier chunk whose lists came from FetchFrontier.
+static vector<int> gpu_relax_round(vector<int>& level, BfsRoundBuffers& buf,
+                                    const vector<int>& frontier, const FetchResult& fetched,
                                     int* raw_next_count_out = nullptr) {
     if (raw_next_count_out) *raw_next_count_out = 0;
-    if (frontier.empty()) { if (consumed_out) *consumed_out = 0; return {}; }
+    int num_f = (int)frontier.size();
+    if (num_f == 0) return {};
 
-    int num_f = bound_by_cumulative_degree(graph, frontier, MAX_ROUND_FRONTIER); // core/chunking.h
-    if (consumed_out) *consumed_out = (size_t)num_f;
-    if (num_f == 0) {
-        if (!frontier.empty()) {
-            fprintf(stderr, "gpu_relax_round: WARNING -- frontier non-empty (%zu vertices) "
-                    "but num_f==0; smallest-degree vertex still exceeds MAX_ROUND_FRONTIER "
-                    "(%d). This work is being silently dropped.\n",
-                    frontier.size(), MAX_ROUND_FRONTIER);
-        }
-        return {};
-    }
-    touched_out += num_f;
-
-    auto fetch_t0 = chrono::high_resolution_clock::now();
-    vector<vector<int>> fetched(num_f);
-    #pragma omp parallel for if(num_f > 2000) schedule(dynamic, 256)
-    for (int i = 0; i < num_f; i++) {
-        vector<int> local_scratch;
-        graph.neighbors_into(frontier[i], local_scratch);
-        fetched[i] = std::move(local_scratch);
-    }
-    g_fetch_ms += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - fetch_t0).count();
-
-    // Sequential pack: cheap now that the actual mmap-backed fetches
-    // (the expensive, previously-serialized part) already happened above.
     buf.h_offsets[0] = 0;
     long long elem_count = 0;
     for (int i = 0; i < num_f; i++) {
@@ -235,7 +198,7 @@ static vector<int> gpu_relax_round(HybridGraph& graph, vector<int>& level,
         buf.d_ids, buf.d_aux_levels, num_f, buf.d_offsets, buf.d_elems,
         buf.d_level, buf.d_next_ids, buf.d_next_count, MAX_ROUND_FRONTIER);
     CUDA_CHECK(cudaEventRecord(t2));
-    CUDA_CHECK(cudaDeviceSynchronize());  // needed for correctness (ordering) on BOTH paths
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     int next_count = buf.read_next_count();
     if (raw_next_count_out) *raw_next_count_out = next_count;
@@ -250,9 +213,7 @@ static vector<int> gpu_relax_round(HybridGraph& graph, vector<int>& level,
             CUDA_CHECK(cudaMemcpy(buf.h_next_ids, buf.d_next_ids, next_count * sizeof(int), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(buf.h_next_levels, buf.d_gather_out, next_count * sizeof(int), cudaMemcpyDeviceToHost));
         }
-        // On integrated GPUs h_next_ids/h_next_levels already alias
-        // d_next_ids/d_gather_out -- the kernel's writes are already
-        // visible to the host after the sync above, nothing to copy.
+
         next_frontier.reserve(next_count);
         for (int i = 0; i < next_count; i++) {
             int id = buf.h_next_ids[i];
@@ -271,9 +232,8 @@ static vector<int> gpu_relax_round(HybridGraph& graph, vector<int>& level,
     return next_frontier;
 }
 
+// Full recompute: traversal from the source (memo bypassed).
 static void gpu_full_bfs(HybridGraph& graph, vector<int>& level, BfsRoundBuffers& buf, int source) {
-    graph.memo_clear();
-    graph.memo_on = false;   // a full traversal must not fill the batch-local memo
     fill(level.begin(), level.end(), UNREACHED);
     level[source] = 0;
 
@@ -287,7 +247,7 @@ static void gpu_full_bfs(HybridGraph& graph, vector<int>& level, BfsRoundBuffers
     }
 
     vector<int> frontier = {source};
-    long long dummy_touched = 0;
+    FetchResult fr;
     while (!frontier.empty()) {
         vector<int> next_frontier;
         size_t i = 0;
@@ -309,11 +269,10 @@ static void gpu_full_bfs(HybridGraph& graph, vector<int>& level, BfsRoundBuffers
                 continue;
             }
             int raw_next = 0;
-            vector<int> chunk_next = gpu_relax_round(graph, level, buf, chunk, dummy_touched, nullptr, &raw_next);
+            fetch_frontier(graph, chunk, fr, false);
+            vector<int> chunk_next = gpu_relax_round(level, buf, chunk, fr, &raw_next);
             if (raw_next > MAX_ROUND_FRONTIER) {
-                // Correctness canary: with degree-bounded chunking this
-                // should be structurally impossible. Report loudly if it
-                // ever fires rather than silently trust the reasoning above.
+
                 fprintf(stderr, "gpu_full_bfs: INTERNAL ERROR -- degree-bounded chunk still overflowed (raw_next=%d) -- results may be wrong\n", raw_next);
             }
             next_frontier.insert(next_frontier.end(), chunk_next.begin(), chunk_next.end());
@@ -322,35 +281,14 @@ static void gpu_full_bfs(HybridGraph& graph, vector<int>& level, BfsRoundBuffers
     }
 }
 
-static vector<int> gpu_deletion_round(HybridGraph& graph, vector<int>& level,
-                                       BfsRoundBuffers& buf, vector<int>& worklist,
-                                       long long& touched_out, size_t* consumed_out = nullptr,
+// One deletion round: each vertex takes 1 + its smallest neighbor level; changed
+// vertices pass their children on.
+static vector<int> gpu_deletion_round(vector<int>& level, BfsRoundBuffers& buf,
+                                       const vector<int>& worklist, const FetchResult& fetched,
                                        int* raw_next_count_out = nullptr) {
     if (raw_next_count_out) *raw_next_count_out = 0;
-    if (worklist.empty()) { if (consumed_out) *consumed_out = 0; return {}; }
-
-    int num_w = bound_by_cumulative_degree(graph, worklist, MAX_ROUND_FRONTIER); // core/chunking.h
-    if (consumed_out) *consumed_out = (size_t)num_w;
-    if (num_w == 0) {
-        if (!worklist.empty()) {
-            fprintf(stderr, "gpu_deletion_round: WARNING -- worklist non-empty (%zu vertices) "
-                    "but num_w==0; smallest-degree vertex still exceeds MAX_ROUND_FRONTIER "
-                    "(%d). This work is being silently dropped.\n",
-                    worklist.size(), MAX_ROUND_FRONTIER);
-        }
-        return {};
-    }
-    touched_out += num_w;
-
-    auto fetch_t0 = chrono::high_resolution_clock::now();
-    vector<vector<int>> fetched(num_w);
-    #pragma omp parallel for if(num_w > 2000) schedule(dynamic, 256)
-    for (int i = 0; i < num_w; i++) {
-        vector<int> local_scratch;
-        graph.neighbors_into(worklist[i], local_scratch);
-        fetched[i] = std::move(local_scratch);
-    }
-    g_fetch_ms += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - fetch_t0).count();
+    int num_w = (int)worklist.size();
+    if (num_w == 0) return {};
 
     buf.h_offsets[0] = 0;
     long long elem_count = 0;
@@ -423,8 +361,6 @@ struct Stats {
     double fallback_ms = 0;
 };
 
-struct Edit { int u, v; bool isInsertion; };
-
 static inline void sync_level_to_device(BfsRoundBuffers& buf, int idx, int value) {
     if (g_integrated) {
         buf.h_level_view[idx] = value;
@@ -433,98 +369,102 @@ static inline void sync_level_to_device(BfsRoundBuffers& buf, int idx, int value
     }
 }
 
-static void processBatch(vector<Edit>& batch, HybridGraph& graph, vector<int>& level,
-                          int source, Stats& stats, BfsRoundBuffers& buf) {
-    graph.memo_clear();   // batch-local memo
-    auto t0 = chrono::high_resolution_clock::now();
+// The next part of a frontier that fits one GPU round.
+static vector<int> next_chunk(HybridGraph& graph, const vector<int>& frontier, size_t pos) {
+    vector<int> chunk;
+    long long deg_sum = 0;
+    for (size_t i = pos; i < frontier.size(); i++) {
+        long long d = (long long)graph.degree(frontier[i]);
+        if (!chunk.empty() && (deg_sum + d > MAX_ROUND_FRONTIER || chunk.size() >= (size_t)MAX_ROUND_FRONTIER)) break;
+        chunk.push_back(frontier[i]);
+        deg_sum += d;
+    }
+    return chunk;
+}
 
-    for (auto& e : batch) {
+struct BfsApp {
+    HybridGraph& graph;
+    vector<int>& level;
+    BfsRoundBuffers& buf;
+    int source;
+    Stats& stats;
+    Budget deletion_budget;
+
+    struct Search {
+        bool deletion = false;
+        vector<int> frontier, next;
+        size_t pos = 0;
+        long long touched = 0;
+    };
+
+    Budget budget_for(const Update& e) { return e.ins ? Budget::unbounded() : deletion_budget; }
+
+    // seed: the improved endpoint of an insertion, the child of a deleted tree edge.
+    bool seed(const Update& e, Search& R, Budget&) {
         int u = e.u, v = e.v;
-        if (e.isInsertion) {
-            graph.insertEdge(u, v);
+        if (e.ins) {
             stats.insertions++;
             bool improve_v = (level[u] != UNREACHED) && (level[v] == UNREACHED || level[u] + 1 < level[v]);
             bool improve_u = (level[v] != UNREACHED) && (level[u] == UNREACHED || level[v] + 1 < level[u]);
-            if (!improve_u && !improve_v) { stats.insertions_noop++; continue; }
-
-            vector<int> frontier;
-            if (improve_v) {
-                level[v] = level[u] + 1;
-                sync_level_to_device(buf, v, level[v]);
-                frontier.push_back(v);
-            }
-            if (improve_u) {
-                level[u] = level[v] + 1;
-                sync_level_to_device(buf, u, level[u]);
-                frontier.push_back(u);
-            }
-            long long touched = (long long)frontier.size();
-            while (!frontier.empty()) {
-                frontier = gpu_relax_round(graph, level, buf, frontier, touched);
-            }
-            stats.insertions_repaired++;
-            stats.total_affected_vertices += touched;
-        } else {
-            graph.removeEdge(u, v);
-            stats.deletions++;
-            bool was_tree_edge = (level[u] != UNREACHED && level[v] == level[u] + 1) ||
-                                  (level[v] != UNREACHED && level[u] == level[v] + 1);
-            if (!was_tree_edge) { stats.deletions_noop++; continue; }
-
-            int child = (level[u] > level[v]) ? u : v;
-            static const size_t CASCADE_SAFETY_BOUND = (size_t)make_fallback_bound(
-                getenv("SCOUT_BFS_BOUND") ? atoll(getenv("SCOUT_BFS_BOUND")) : 200); // core/local_repair.h; bound b (200: chosen by sweep, see eval)
-            vector<int> worklist = {child};
-            size_t touched_count = 0;
-            bool used_fallback = false;
-            long long dummy_touched = 0;
-            while (!worklist.empty()) {
-                touched_count += worklist.size();
-                if (touched_count > CASCADE_SAFETY_BOUND) {
-                    if (g_defer_fallback) {
-                        stats.deletions_fallback_deferred++;
-                        used_fallback = true;
-                        break;
-                    }
-                    auto fb0 = chrono::high_resolution_clock::now();
-                    gpu_full_bfs(graph, level, buf, source);
-                    auto fb1 = chrono::high_resolution_clock::now();
-                    stats.fallback_ms += chrono::duration<double, milli>(fb1 - fb0).count();
-                    used_fallback = true;
-                    break;
-                }
-                {
-                    int raw_next = 0;
-                    worklist = gpu_deletion_round(graph, level, buf, worklist, dummy_touched,
-                                                   nullptr, &raw_next);
-                    if (raw_next > (int)MAX_ROUND_FRONTIER) {
-                        fprintf(stderr, "gpu_deletion_round: INTERNAL ERROR -- "
-                                "output truncated (raw_next_count=%d > %d). "
-                                "Do not raise CASCADE_SAFETY_BOUND yet.\n",
-                                raw_next, MAX_ROUND_FRONTIER);
-                    }
-                }
-            }
-            if (used_fallback) stats.deletions_fallback++;
-            else stats.deletions_local++;
+            if (!improve_u && !improve_v) { stats.insertions_noop++; return false; }
+            if (improve_v) { level[v] = level[u] + 1; sync_level_to_device(buf, v, level[v]); R.frontier.push_back(v); }
+            if (improve_u) { level[u] = level[v] + 1; sync_level_to_device(buf, u, level[u]); R.frontier.push_back(u); }
+            R.touched = (long long)R.frontier.size();
+            return true;
         }
+        stats.deletions++;
+        bool was_tree_edge = (level[u] != UNREACHED && level[v] == level[u] + 1) ||
+                             (level[v] != UNREACHED && level[u] == level[v] + 1);
+        if (!was_tree_edge) { stats.deletions_noop++; return false; }
+        R.deletion = true;
+        R.frontier.push_back((level[u] > level[v]) ? u : v);
+        return true;
     }
 
-    auto t1 = chrono::high_resolution_clock::now();
-    stats.total_batch_ms += chrono::duration<double, milli>(t1 - t0).count();
-}
+    bool resolved(const Search& R) const { return R.frontier.empty(); }
+
+    // select: a deletion's search is charged |level| when the level starts.
+    vector<int> select(Search& R, Budget& bud) {
+        if (R.deletion && R.pos == 0) bud.vertices += (long long)R.frontier.size();
+        return next_chunk(graph, R.frontier, R.pos);
+    }
+
+    void expand(Search& R, const vector<int>& Y, const FetchResult& fr, Budget&) {
+        int raw_next = 0;
+        vector<int> out = R.deletion ? gpu_deletion_round(level, buf, Y, fr, &raw_next)
+                                     : gpu_relax_round(level, buf, Y, fr, &raw_next);
+        if (raw_next > (int)MAX_ROUND_FRONTIER)
+            fprintf(stderr, "bfs round: INTERNAL ERROR -- output truncated (raw_next_count=%d > %d)\n",
+                    raw_next, MAX_ROUND_FRONTIER);
+        R.next.insert(R.next.end(), out.begin(), out.end());
+        R.touched += (long long)Y.size();
+        R.pos += Y.size();
+        if (R.pos >= R.frontier.size()) { R.frontier = std::move(R.next); R.next.clear(); R.pos = 0; }
+    }
+
+    void commit(const Search& R) {
+        if (R.deletion) stats.deletions_local++;
+        else { stats.insertions_repaired++; stats.total_affected_vertices += R.touched; }
+    }
+
+    void fallback(const Search&) {
+        stats.deletions_fallback++;
+        if (g_defer_fallback) { stats.deletions_fallback_deferred++; return; }
+        auto fb0 = chrono::high_resolution_clock::now();
+        gpu_full_bfs(graph, level, buf, source);
+        stats.fallback_ms += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - fb0).count();
+    }
+};
 
 int main(int argc, char* argv[]) {
-    ScoutCliArgs args = parse_scout_cli(argc, argv, "bfs"); // core/cli_setup.h
-    g_integrated = gpu_warmup_and_device_setup(args.gpu_id); // core/cli_setup.h
-    if (getenv("SCOUT_FORCE_COPY")) g_integrated = false;  // integrated GPU: use device buffers + copies instead of mapped host memory
+    ScoutCliArgs args = parse_scout_cli(argc, argv, "bfs");
+    g_integrated = gpu_warmup_and_device_setup(args.gpu_id);
+    if (getenv("SCOUT_FORCE_COPY")) g_integrated = false;
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, args.gpu_id));
 
-    // Deferred fallback is the production default. SCOUT_DEFER_FALLBACK=0
-    // explicitly opts back into the old immediate-per-event behavior.
-    g_defer_fallback = read_defer_fallback_env(/*production_default=*/true); // core/local_repair.h
+    g_defer_fallback = read_defer_fallback_env(true);
     cout << (g_defer_fallback
              ? "[Deferred fallback: ON (default)] Cascades past the safety bound are deferred; "
                "resolved by ONE catch-up gpu_full_bfs after all batches, instead of one call each."
@@ -539,15 +479,15 @@ int main(int argc, char* argv[]) {
     int num_nodes = graph.num_nodes;
 
     long long total_degree = 0;
-    total_degree = graph.base.edges;   // no updates applied yet: sum of degrees = stored edges
+    total_degree = graph.base.edges;
     double avg_degree = num_nodes > 0 ? (double)total_degree / num_nodes : 0.0;
-    print_run_header("bfs", args.egr_path, num_nodes, total_degree, avg_degree, prop.name, g_integrated); // core/reporting.h
+    print_run_header("bfs", args.egr_path, num_nodes, total_degree, avg_degree, prop.name, g_integrated);
 
     vector<int> level(num_nodes, UNREACHED);
     int source = 0;
     int initial_reached = 0;
     {
-        vector<long long> vals = read_ints_fast(args.context_path); // core/cli_setup.h: "node_id level" pairs
+        vector<long long> vals = read_ints_fast(args.context_path);
         for (size_t k = 0; k + 1 < vals.size(); k += 2) {
             int idx = (int)vals[k] - 1, lv = (int)vals[k + 1];
             if (idx >= 0 && idx < num_nodes) { level[idx] = lv; if (lv >= 0) initial_reached++; }
@@ -565,27 +505,37 @@ int main(int argc, char* argv[]) {
     auto setup_t1 = chrono::high_resolution_clock::now();
     double setup_ms = chrono::duration<double, milli>(setup_t1 - setup_t0).count();
 
-    vector<filesystem::path> batch_paths = list_batch_files_sorted(args.batch_dir); // core/cli_setup.h
+    vector<filesystem::path> batch_paths = list_batch_files_sorted(args.batch_dir);
 
     Stats stats;
+    BfsApp app{graph, level, buf, source, stats,
+               Budget::from_env(getenv("SCOUT_BFS_BOUND") ? atoll(getenv("SCOUT_BFS_BOUND")) : 200)};
+    cout << "[NL driver] deletion budget: " << app.deletion_budget.describe()
+         << ", memo " << (graph.memo_on ? "on" : "off (SCOUT_NO_MEMO)") << endl;
     int processed = 0;
     for (const auto& path : batch_paths) {
         if (processed >= args.num_batches) break;
-        vector<EdgeUpdate> raw_batch = parse_batch_file(path, graph, num_nodes); // core/cli_setup.h
-        vector<Edit> batch;
+        vector<EdgeUpdate> raw_batch = parse_batch_file(path, graph, num_nodes);
+        vector<Update> batch;
         batch.reserve(raw_batch.size());
         for (const auto& e : raw_batch) batch.push_back({e.u, e.v, e.is_insertion});
         Stats before = stats;
-        double f0 = g_fetch_ms, x0 = g_transfer_ms, k0 = g_kernel_ms, c0 = g_commit_ms;
-        processBatch(batch, graph, level, source, stats, buf);
-        double this_batch_ms = stats.total_batch_ms - before.total_batch_ms;
-        print_batch_result(processed + 1, args.num_batches, (int)batch.size(), this_batch_ms, // core/reporting.h
+        FetchStats fs0 = g_fetch;
+        long long mf0 = process_major_faults();
+        double x0 = g_transfer_ms, k0 = g_kernel_ms, c0 = g_commit_ms;
+        auto bt0 = chrono::high_resolution_clock::now();
+        nl_process_batch(app, graph, batch);
+        double this_batch_ms = chrono::duration<double, milli>(chrono::high_resolution_clock::now() - bt0).count();
+        stats.total_batch_ms += this_batch_ms;
+        print_batch_result(processed + 1, args.num_batches, (int)batch.size(), this_batch_ms,
             {{"insertions", to_string(stats.insertions - before.insertions)},
              {"deletions", to_string(stats.deletions - before.deletions)},
              {"fallback", to_string(stats.deletions_fallback - before.deletions_fallback)}});
         {
-            double f = g_fetch_ms - f0, x = g_transfer_ms - x0, k = g_kernel_ms - k0, c = g_commit_ms - c0;
-            print_stage_times(processed + 1, f, max(0.0, this_batch_ms - f - x - k - c), x, k, c); // core/reporting.h
+            double f = g_fetch.ms - fs0.ms, x = g_transfer_ms - x0, k = g_kernel_ms - k0, c = g_commit_ms - c0;
+            print_stage_times(processed + 1, f, max(0.0, this_batch_ms - f - x - k - c), x, k, c);
+            print_fetch_stats(processed + 1, g_fetch.pages - fs0.pages, process_major_faults() - mf0, g_fetch.lists - fs0.lists,
+                              g_fetch.memo_hits - fs0.memo_hits);
         }
         processed++;
     }
@@ -604,6 +554,8 @@ int main(int argc, char* argv[]) {
     long long final_reached = 0;
     for (int i = 0; i < num_nodes; i++) if (level[i] != UNREACHED) final_reached++;
 
+    cout << "Pages requested (Alg. 1): " << g_fetch.pages << " | lists reconciled: " << g_fetch.lists
+         << " | memo hits: " << g_fetch.memo_hits << endl;
     cout << "Insertions: " << stats.insertions << " (noop=" << stats.insertions_noop
          << ", repaired=" << stats.insertions_repaired << ")" << endl;
     cout << "Deletions:  " << stats.deletions << " (noop=" << stats.deletions_noop
@@ -615,13 +567,11 @@ int main(int argc, char* argv[]) {
 
     double processing_ms = stats.total_batch_ms + deferred_fallback_ms;
     double e2e_ms = setup_ms + processing_ms;
-    print_final_summary(setup_ms, processing_ms, e2e_ms, // core/reporting.h
+    print_final_summary(setup_ms, processing_ms, e2e_ms,
                          "reached vertices", initial_reached,
                          "reached vertices", final_reached);
 
-    // Results are printed; skip freeing pinned/mapped buffers and CUDA context teardown
-    // (the OS reclaims them), which otherwise adds seconds after the work is done.
-    if (!g_touched.empty()) dump_touched_at_exit();   // SCOUT_DUMP_TOUCHED: _Exit skips atexit handlers
+    if (!g_touched.empty()) dump_touched_at_exit();
     std::cout.flush();
     fflush(stdout);
     std::_Exit(0);

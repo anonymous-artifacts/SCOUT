@@ -1,5 +1,4 @@
-// cli_setup.h: command-line parsing, GPU device setup, and batch/initial-state file I/O
-// shared by all SCOUT algorithms.
+// Command line, device setup, and batch / initial-state file reading.
 
 #pragma once
 
@@ -12,8 +11,7 @@
 #include <filesystem>
 #include <algorithm>
 
-class HybridGraph; // forward decl -- full definition comes from core/FlashGraph.h,
-                    // included by the caller before this header is used.
+class HybridGraph;
 
 struct ScoutCliArgs {
     std::string egr_path;
@@ -23,12 +21,6 @@ struct ScoutCliArgs {
     int gpu_id;
 };
 
-// Replaces the identical `if (argc < 6) { usage; return 1; }` + 5 positional
-// argv reads duplicated in every algorithm's main(). `usage_algo_name` names
-// the algorithm in the printed usage line (e.g. "bfs", "cc") so a user
-// running the wrong binary gets a clear message. Exits the process (matching
-// every existing call site's own behavior) rather than returning an error
-// code, since none of the callers did anything but `return 1` on failure.
 inline ScoutCliArgs parse_scout_cli(int argc, char** argv, const char* usage_algo_name) {
     if (argc < 6) {
         std::cerr << "Usage: " << argv[0] << " <graph.egr> <initial_" << usage_algo_name
@@ -44,23 +36,12 @@ inline ScoutCliArgs parse_scout_cli(int argc, char** argv, const char* usage_alg
     return a;
 }
 
-// Replaces the identical cudaSetDevice + cudaFree(0) warmup call duplicated
-// in every main(). Returns whether the selected device is integrated
-// (unified memory, e.g. Jetson Orin) vs discrete (e.g. L40S/A5000) --
-// callers store this in their own g_integrated (or equivalent) and print
-// their own GPU banner line, since the exact wording of that line has
-// historically differed slightly per algorithm and isn't worth forcing
-// identical here.
 inline bool gpu_warmup_and_device_setup(int gpu_id) {
     CUDA_CHECK(cudaSetDevice(gpu_id));
     CUDA_CHECK(cudaFree(0));
     return detect_integrated_gpu(gpu_id);
 }
 
-// Replaces the identical numeric-stem-sorted batch-folder directory
-// iteration duplicated in every main() (batch files are named "1.mtx",
-// "2.mtx", ... and must be processed in that numeric order, not lexical --
-// lexical would put "10.mtx" before "2.mtx").
 inline std::vector<std::filesystem::path> list_batch_files_sorted(const std::string& batch_dir) {
     std::vector<std::filesystem::path> batch_paths;
     for (const auto& entry : std::filesystem::directory_iterator(batch_dir)) {
@@ -78,13 +59,8 @@ struct EdgeUpdate {
     bool is_insertion;
 };
 
-// Replaces the identical per-line edge-parsing loop duplicated in every
-// main()'s batch-processing loop: 1-indexed raw file -> 0-indexed u/v,
-// bounds check against num_nodes, self-loop rejection, and classification
-// of the edit as insertion-vs-deletion based on the graph's CURRENT
-// adjacency state at parse time (i.e. before this batch's own edits are
-// applied -- matches every existing call site's semantics exactly).
 template <typename GraphT>
+// A line "u v" (1-indexed) is an insertion if the edge is absent, else a deletion.
 inline std::vector<EdgeUpdate> parse_batch_file(const std::filesystem::path& path, GraphT& graph, int num_nodes) {
     std::vector<EdgeUpdate> batch;
     std::ifstream file(path);
@@ -102,9 +78,6 @@ inline std::vector<EdgeUpdate> parse_batch_file(const std::filesystem::path& pat
     return batch;
 }
 
-// Fast reader for the initial-state files (one or more integers per line):
-// one read of the whole file, then strtol, instead of a getline/istringstream
-// per line. Returns every integer in file order.
 #include <cstdio>
 #include <cstdlib>
 inline std::vector<long long> read_ints_fast(const std::string& path) {
@@ -129,4 +102,3 @@ inline std::vector<long long> read_ints_fast(const std::string& path) {
     }
     return out;
 }
-

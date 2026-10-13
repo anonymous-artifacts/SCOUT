@@ -33,7 +33,17 @@ Environment overrides:
   NVCC              nvcc binary to build with (default: nvcc on PATH)
   SCOUT_ARCH_FLAG   nvcc architecture flag (default: -arch=native, needs CUDA >= 11.6;
                     on an older toolkit set this explicitly, e.g. SCOUT_ARCH_FLAG=-arch=sm_87)
-  SCOUT_SKIP_COMPACTION=1   mis: skip the end-of-run .egr compaction step
+  SCOUT_SKIP_COMPACTION=1   mis: skip the end-of-run .egr compaction step (always skipped
+                            with --sample, so the bundled graph is never rewritten)
+  SCOUT_NO_MEMO=1           disable the batch-local memo of fetched lists
+  SCOUT_NO_OVERLAP=1        mis, coloring: no CPU/GPU overlap across batches
+  SCOUT_NO_MADV_RANDOM=1    keep the kernel's readahead on the mapped graph
+  SCOUT_FETCH_THREADS=T     fetch workers T (default: min(cores, 64))
+  SCOUT_MEMO_MAX_BYTES=N    evict the memo when it grows past N bytes
+  SCOUT_BUDGET=MODE         bfs, cc search budget: count (default), unbounded, or mem:<bytes>
+  SCOUT_BFS_BOUND=b         bfs: count bound b (default 200)
+  SCOUT_DEFER_FALLBACK=0    bfs, cc: recompute at once when a search exceeds its budget
+  SCOUT_VALIDATE=1          mis, coloring: check the final solution against the final graph
 EOF
 }
 
@@ -73,6 +83,7 @@ case "$PROBLEM" in
 esac
 
 if [ "$USE_SAMPLE" = "1" ]; then
+    export SCOUT_SKIP_COMPACTION=1
     GRAPH="${GRAPH:-$SCRIPT_DIR/datasets/sample/sample.egr}"
     INIT="${INIT:-$SCRIPT_DIR/datasets/sample/$SAMPLE_INIT}"
     BATCH="${BATCH:-$SCRIPT_DIR/datasets/sample/batches}"

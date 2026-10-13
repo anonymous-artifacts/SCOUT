@@ -1,5 +1,5 @@
-// gpu_common.h: CUDA error checking, integrated-GPU detection, and paired host/device
-// allocation (mapped zero-copy memory on integrated GPUs, pinned host + device memory otherwise).
+// CUDA error checks, integrated-GPU detection, and host/device buffer pairs: zero-copy on
+// integrated GPUs (Jetson), pinned host + device memory on discrete ones.
 
 #pragma once
 
@@ -18,28 +18,12 @@
         } \
     } while(0)
 
-// Detects whether the given GPU device has a unified (integrated) memory
-// architecture (e.g. Jetson Orin) vs. a discrete one (e.g. L40S/A5000).
-// Callers store the result in their own local/global -- this function has
-// no side effects beyond the query itself.
 inline bool detect_integrated_gpu(int device_id) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
     return prop.integrated != 0;
 }
 
-// Allocates a host+device pointer pair for `count` elements of type T, using
-// the platform-appropriate strategy:
-//   - integrated GPU: true zero-copy via cudaHostAlloc(cudaHostAllocMapped) +
-//     cudaHostGetDevicePointer -- the host buffer IS the device-visible
-//     buffer, nothing to transfer.
-//   - discrete GPU: a real pinned host allocation (cudaMallocHost) plus a
-//     separate device allocation (cudaMalloc); the caller is responsible for
-//     the explicit cudaMemcpy(Async) to move data between them.
-// `integrated` is passed explicitly (not read from a global) so this
-// function has no hidden dependency on any particular translation unit's
-// g_integrated variable -- every caller already has its own copy of that
-// flag from calling detect_integrated_gpu() once at startup.
 template <typename T>
 inline void alloc_pair(T** h_ptr, T** d_ptr, size_t count, bool integrated) {
     if (integrated) {
@@ -51,12 +35,6 @@ inline void alloc_pair(T** h_ptr, T** d_ptr, size_t count, bool integrated) {
     }
 }
 
-// Variant used where the caller has the data ready up front and wants it
-// uploaded immediately (as opposed to alloc_pair's allocate-now-fill-later
-// shape, used by per-round buffers). `h_view_out` receives the host-visible
-// pointer on integrated GPUs (nullptr on discrete, since there nothing
-// aliases the device buffer -- the data lives only on the device after this
-// call, matching the original single-shot-upload call sites this replaces).
 template <typename T>
 inline void alloc_and_upload(T** d_ptr, const std::vector<T>& h_data, T** h_view_out, bool integrated) {
     size_t bytes = h_data.size() * sizeof(T);

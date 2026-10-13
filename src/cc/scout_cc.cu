@@ -1,17 +1,5 @@
-// SCOUT: dynamic connected components (non-LCL problem) on a storage-resident graph.
-//
-// Each vertex carries a component label; a union-find forest is kept over the labels.
-// Insertions union the two labels. A deletion runs a bidirectional search from both
-// endpoints, always expanding the smaller frontier: if the sides meet, nothing changes;
-// if one side is exhausted, it receives a fresh label. The search is unbounded on sparse
-// graphs (average degree < 10) and bounded otherwise; deletions left unresolved by the
-// bounded search are settled by one recomputation over the graph after the stream
-// (GPU hook-and-shortcut, or a streamed host pass when the graph exceeds device memory).
-//
-// Usage: scout_cc <graph.egr> <initial_components.txt> <batch_dir> <num_batches> <gpu_id>
-//   initial_components.txt: one component root id per line (vertex order)
-// Environment: SCOUT_DEFER_FALLBACK=0 (recompute at each unresolved deletion instead of
-//   once after the stream), SCOUT_NO_MEMO, SCOUT_NO_MADV_RANDOM, SCOUT_DUMP_TOUCHED=<file>.
+// SCOUT connected components (non-LCL) on the NL driver. Labels with a union-find over
+// labels; a deletion runs a bidirectional search, and a split side gets a fresh label.
 
 #include <cuda_runtime.h>
 #include <iostream>
@@ -31,9 +19,10 @@
 #include "../../core/cli_setup.h"
 #include "../../core/local_repair.h"
 #include "../../core/reporting.h"
+#include "../../core/fetch.h"
+#include "../../core/nl_driver.h"
 
 using namespace std;
-// CUDA_CHECK now comes from core/gpu_common.h -- no longer defined here.
 
 __global__ void cc_hook_kernel(int num_nodes, const long long* nindex, const int* nlist,
                                 int* parent, int* changed) {
@@ -47,7 +36,7 @@ __global__ void cc_hook_kernel(int num_nodes, const long long* nindex, const int
         if (pv == pn) continue;
         int hi = pv > pn ? pv : pn;
         int lo = pv > pn ? pn : pv;
-        if (parent[hi] == hi) { // only hook if hi is currently a root
+        if (parent[hi] == hi) {
             parent[hi] = lo;
             *changed = 1;
         }
@@ -62,15 +51,15 @@ __global__ void cc_shortcut_kernel(int num_nodes, int* parent) {
 
 #define CC_THREADS_PER_BLOCK 256
 
-static bool g_integrated = false; // set in main() from cudaDeviceProp.integrated
-static bool g_defer_fallback = false; // set in main() from SCOUT_DEFER_FALLBACK -- see core/local_repair.h's read_defer_fallback_env for the default-polarity fix applied here
-static bool g_use_exhaustive_search = false; // set in main() from measured average degree -- v2; kept only for the "EXHAUSTIVE/CAPPED search mode" console message below
-static long long g_fallback_bound = 5000; // set in main() via core/local_repair.h's make_fallback_bound -- the actual bound processBatch() uses
-static const double LOW_DEGREE_THRESHOLD = 10.0; // provisional -- see file header comment
+static bool g_integrated = false;
+static bool g_defer_fallback = false;
+static bool g_use_exhaustive_search = false;
+static long long g_fallback_bound = 5000;
+static const double LOW_DEGREE_THRESHOLD = 10.0;
 
 template <typename T>
 static void cc_alloc_and_upload(T** d_ptr, const vector<T>& h_data, T** h_view_out) {
-    ::alloc_and_upload(d_ptr, h_data, h_view_out, g_integrated); // core/gpu_common.h
+    ::alloc_and_upload(d_ptr, h_data, h_view_out, g_integrated);
 }
 
 static int find_root_atomic(int* p, int v) {
@@ -83,6 +72,7 @@ static int find_root_atomic(int* p, int v) {
     }
 }
 
+// Host recompute, used when the graph does not fit in free GPU memory.
 static void full_recompute_cc_streamed(HybridGraph& graph, vector<int>& parent, int num_nodes) {
     auto t0 = chrono::high_resolution_clock::now();
     int* p = parent.data();
@@ -93,9 +83,9 @@ static void full_recompute_cc_streamed(HybridGraph& graph, vector<int>& parent, 
         vector<int> scratch;
         #pragma omp for schedule(dynamic, 4096)
         for (int v = 0; v < num_nodes; v++) {
-            graph.neighbors_into(v, scratch);
+            graph.neighbors_direct(v, scratch);
             for (int u : scratch) {
-                if (u <= v) continue;   // each undirected edge once
+                if (u <= v) continue;
                 int a = v, b = u;
                 while (true) {
                     a = find_root_atomic(p, a);
@@ -115,9 +105,8 @@ static void full_recompute_cc_streamed(HybridGraph& graph, vector<int>& parent, 
     fflush(stderr);
 }
 
+// Full recompute: one sequential pass over the current graph, streamed to the GPU.
 static void full_recompute_cc_gpu(HybridGraph& graph, vector<int>& parent, int num_nodes) {
-    graph.memo_clear();
-    graph.memo_on = false;   // a full pass must not fill the batch-local memo
     if (!g_integrated) {
         size_t free_b = 0, total_b = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
@@ -133,9 +122,7 @@ static void full_recompute_cc_gpu(HybridGraph& graph, vector<int>& parent, int n
     for (int v = 0; v < num_nodes; v++) {
         deg[v] = graph.degree(v);
     }
-    // Step 2: prefix sum -- inherently sequential, but trivially fast
-    // (just integer addition over already-computed values, no graph
-    // access at all).
+
     h_nindex[0] = 0;
     for (int v = 0; v < num_nodes; v++) h_nindex[v + 1] = h_nindex[v] + deg[v];
     long long total_edges = h_nindex[num_nodes];
@@ -149,7 +136,7 @@ static void full_recompute_cc_gpu(HybridGraph& graph, vector<int>& parent, int n
             vector<int> scratch;
             #pragma omp for schedule(dynamic, 4096)
             for (int v = 0; v < num_nodes; v++) {
-                graph.neighbors_into(v, scratch);
+                graph.neighbors_direct(v, scratch);
                 long long off = h_nindex[v];
                 for (size_t i = 0; i < scratch.size(); i++) h_nlist_view[off + i] = scratch[i];
             }
@@ -177,7 +164,7 @@ static void full_recompute_cc_gpu(HybridGraph& graph, vector<int>& parent, int n
             long long e = h_nindex[chunk_vstart[c + 1]] - h_nindex[chunk_vstart[c]];
             if (e > max_chunk_edges) max_chunk_edges = e;
         }
-        if (max_chunk_edges == 0) max_chunk_edges = 1; // degenerate (tiny graph) safety
+        if (max_chunk_edges == 0) max_chunk_edges = 1;
 
         int* h_stage[2];
         cudaStream_t stream[2];
@@ -188,7 +175,7 @@ static void full_recompute_cc_gpu(HybridGraph& graph, vector<int>& parent, int n
 
         for (int c = 0; c < n_chunks; c++) {
             int buf = c % 2;
-            if (c >= 2) CUDA_CHECK(cudaStreamSynchronize(stream[buf])); // reuse: this buffer's prior transfer must be done first
+            if (c >= 2) CUDA_CHECK(cudaStreamSynchronize(stream[buf]));
 
             int v_start = chunk_vstart[c], v_end = chunk_vstart[c + 1];
             long long base_off = h_nindex[v_start];
@@ -197,7 +184,7 @@ static void full_recompute_cc_gpu(HybridGraph& graph, vector<int>& parent, int n
                 vector<int> scratch;
                 #pragma omp for schedule(dynamic, 4096)
                 for (int v = v_start; v < v_end; v++) {
-                    graph.neighbors_into(v, scratch);
+                    graph.neighbors_direct(v, scratch);
                     long long local_off = h_nindex[v] - base_off;
                     for (size_t i = 0; i < scratch.size(); i++) h_stage[buf][local_off + i] = scratch[i];
                 }
@@ -249,8 +236,7 @@ static void full_recompute_cc_gpu(HybridGraph& graph, vector<int>& parent, int n
         }
         rounds++;
     }
-    // A few extra shortcut passes to guarantee full flattening (every
-    // parent[v] is the true root, not just close to it).
+
     for (int i = 0; i < 8; i++) cc_shortcut_kernel<<<blocks, CC_THREADS_PER_BLOCK>>>(num_nodes, d_parent);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -262,8 +248,7 @@ static void full_recompute_cc_gpu(HybridGraph& graph, vector<int>& parent, int n
         cudaFreeHost(h_parent_view); cudaFreeHost(h_changed_view);
     } else {
         CUDA_CHECK(cudaMemcpy(parent.data(), d_parent, (size_t)num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
-        // Zero-copy's d_* pointers alias cudaHostAlloc'd memory, already
-        // freed via cudaFreeHost above -- cudaFree on those would be wrong.
+
         cudaFree(d_nindex); cudaFree(d_nlist); cudaFree(d_parent); cudaFree(d_changed);
     }
 
@@ -288,59 +273,6 @@ static int find_root(vector<int>& parent, int v) {
     return root;
 }
 
-static bool unite(vector<int>& parent, int u, int v) {
-    int ru = find_root(parent, u), rv = find_root(parent, v);
-    if (ru == rv) return false;
-    if (ru < rv) parent[rv] = ru; else parent[ru] = rv; // deterministic: lower root wins
-    return true;
-}
-
-enum ReachResult { STILL_CONNECTED, DEFINITIVE_SPLIT, INCONCLUSIVE };
-
-static ReachResult bidirectional_reachability_check(HybridGraph& graph, int u, int v,
-                                                      size_t bound, vector<int>& touched_side,
-                                                      int& new_root_out) {
-    touched_side.clear();
-    if (u == v) return STILL_CONNECTED;
-
-    unordered_set<int> visited_u, visited_v;
-    visited_u.insert(u);
-    visited_v.insert(v);
-    vector<int> frontier_u = {u}, frontier_v = {v};
-    vector<int> scratch;
-    size_t total_touched = 2; // u and v themselves
-
-    while (!frontier_u.empty() && !frontier_v.empty()) {
-        bool expand_u_side = frontier_u.size() <= frontier_v.size();
-        vector<int>& frontier = expand_u_side ? frontier_u : frontier_v;
-        unordered_set<int>& visited_this = expand_u_side ? visited_u : visited_v;
-        unordered_set<int>& visited_other = expand_u_side ? visited_v : visited_u;
-
-        vector<int> next;
-        for (int cur : frontier) {
-            graph.neighbors_into(cur, scratch);
-            for (int n : scratch) {
-                if (visited_other.count(n)) return STILL_CONNECTED; // met in the middle
-                if (visited_this.count(n)) continue;
-                visited_this.insert(n);
-                next.push_back(n);
-                total_touched++;
-                if (total_touched > bound) return INCONCLUSIVE;
-            }
-        }
-        if (expand_u_side) frontier_u = next; else frontier_v = next;
-    }
-
-    if (frontier_u.empty()) {
-        touched_side.assign(visited_u.begin(), visited_u.end());
-        new_root_out = u;
-    } else {
-        touched_side.assign(visited_v.begin(), visited_v.end());
-        new_root_out = v;
-    }
-    return DEFINITIVE_SPLIT;
-}
-
 struct Stats {
     long long insertions = 0, insertions_noop = 0, insertions_merged = 0;
     long long deletions = 0, deletions_noop = 0;
@@ -351,21 +283,15 @@ struct Stats {
     double fallback_ms = 0;
 };
 
-struct Edit { int u, v; bool isInsertion; };
-
-static double g_search_ms = 0;  // eval stage breakdown: time in the bounded bidirectional search
-
-// Component state: every vertex carries a label, and a union-find forest is kept over the
-// labels, never over the vertices themselves. A split gives the separated side a fresh label,
-// so no vertex outside that side can be re-routed through it (the forest is unchanged).
+// Union-find over labels, never over vertices, so a split never reroutes other vertices.
 struct CCLabels {
-    vector<int> label;   // vertex -> label
-    vector<int> lp;      // label -> parent label (union-find)
+    vector<int> label;
+    vector<int> lp;
     int find(int v) { return find_root(lp, label[v]); }
     bool unite_v(int u, int v) {
         int ru = find(u), rv = find(v);
         if (ru == rv) return false;
-        if (ru < rv) lp[rv] = ru; else lp[ru] = rv;   // deterministic: lower label wins
+        if (ru < rv) lp[rv] = ru; else lp[ru] = rv;
         return true;
     }
     void split(const vector<int>& side) {
@@ -373,7 +299,7 @@ struct CCLabels {
         lp.push_back(fresh);
         for (int w : side) label[w] = fresh;
     }
-    void reset_from_roots(const vector<int>& root) {   // after a full recompute: one label per component
+    void reset_from_roots(const vector<int>& root) {
         label = root;
         lp.resize(label.size());
         for (size_t i = 0; i < lp.size(); i++) lp[i] = (int)i;
@@ -389,66 +315,104 @@ struct CCLabels {
     }
 };
 
-static void processBatch(vector<Edit>& batch, HybridGraph& graph, CCLabels& cc, Stats& stats) {
-    graph.memo_clear();   // batch-local memo
-    auto t0 = chrono::high_resolution_clock::now();
-    const size_t SPLIT_SAFETY_BOUND = (size_t)g_fallback_bound;
+#ifndef CC_SELECT_CHUNK
+#define CC_SELECT_CHUNK 4096
+#endif
 
-    for (auto& e : batch) {
+struct CcApp {
+    HybridGraph& graph;
+    CCLabels& cc;
+    Stats& stats;
+    Budget deletion_budget;
+
+    struct Search {
+        unordered_set<int> visited[2];
+        vector<int> frontier[2], next;
+        int side = 0;
+        size_t pos = 0;
+        bool met = false;
+    };
+
+    Budget budget_for(const Update&) { return deletion_budget; }
+
+    // seed: an insertion unions labels (no search); a deletion searches from both endpoints.
+    bool seed(const Update& e, Search& R, Budget& bud) {
         int u = e.u, v = e.v;
-        if (e.isInsertion) {
-            graph.insertEdge(u, v);
+        if (e.ins) {
             stats.insertions++;
             if (cc.unite_v(u, v)) stats.insertions_merged++;
             else stats.insertions_noop++;
-        } else {
-            graph.removeEdge(u, v);
-            stats.deletions++;
-            int ru = cc.find(u), rv = cc.find(v);
-            if (ru != rv) { stats.deletions_noop++; continue; } // shouldn't happen for a real prior edge, but safe
+            return false;
+        }
+        stats.deletions++;
+        if (cc.find(u) != cc.find(v)) { stats.deletions_noop++; return false; }
+        R.visited[0].insert(u); R.frontier[0].push_back(u);
+        R.visited[1].insert(v); R.frontier[1].push_back(v);
+        if (u == v) R.met = true;
+        bud.vertices = 2;
+        return true;
+    }
 
-            vector<int> touched_side;
-            int new_root = -1;
-            auto search_t0 = chrono::high_resolution_clock::now();
-            ReachResult result = bidirectional_reachability_check(graph, u, v, SPLIT_SAFETY_BOUND, touched_side, new_root);
-            g_search_ms += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - search_t0).count();
-            if (result == STILL_CONNECTED) {
-                stats.deletions_still_connected++; // true no-op, structure already correct
-            } else if (result == DEFINITIVE_SPLIT) {
-                stats.deletions_definitive_split++;
-                stats.split_side_total_size += (long long)touched_side.size();
-                if ((long long)touched_side.size() > stats.split_side_max_size)
-                    stats.split_side_max_size = (long long)touched_side.size();
-                cc.split(touched_side);   // fresh label for the separated side
-            } else { // INCONCLUSIVE
-                if (g_defer_fallback) {
-                    stats.deletions_fallback_deferred++;
-                } else {
-                    auto fb0 = chrono::high_resolution_clock::now();
-                    vector<int> roots(cc.label.size());
-                    full_recompute_cc_gpu(graph, roots, (int)roots.size());
-                    cc.reset_from_roots(roots);
-                    auto fb1 = chrono::high_resolution_clock::now();
-                    stats.fallback_ms += chrono::duration<double, milli>(fb1 - fb0).count();
-                    stats.deletions_fallback++;
-                }
+    bool resolved(const Search& R) const { return R.met || R.frontier[0].empty() || R.frontier[1].empty(); }
+
+    // select: the side with the smaller frontier, chosen per level.
+    vector<int> select(Search& R, Budget&) {
+        if (R.pos == 0) R.side = (R.frontier[0].size() <= R.frontier[1].size()) ? 0 : 1;
+        const vector<int>& F = R.frontier[R.side];
+        size_t end = min(F.size(), R.pos + (size_t)CC_SELECT_CHUNK);
+        return vector<int>(F.begin() + R.pos, F.begin() + end);
+    }
+
+    void expand(Search& R, const vector<int>& Y, const FetchResult& fr, Budget& bud) {
+        unordered_set<int>& mine = R.visited[R.side];
+        const unordered_set<int>& other = R.visited[1 - R.side];
+        for (size_t i = 0; i < Y.size(); i++) {
+            for (int n : fr[i]) {
+                if (other.count(n)) { R.met = true; return; }
+                if (!mine.insert(n).second) continue;
+                R.next.push_back(n);
+                bud.vertices++;
+                if (bud.exceeded()) return;
             }
+        }
+        R.pos += Y.size();
+        if (R.pos >= R.frontier[R.side].size()) {
+            R.frontier[R.side] = std::move(R.next);
+            R.next.clear();
+            R.pos = 0;
         }
     }
 
-    auto t1 = chrono::high_resolution_clock::now();
-    stats.total_batch_ms += chrono::duration<double, milli>(t1 - t0).count();
-}
+    void commit(const Search& R) {
+        if (R.met) { stats.deletions_still_connected++; return; }
+        const unordered_set<int>& side = R.frontier[0].empty() ? R.visited[0] : R.visited[1];
+        vector<int> touched(side.begin(), side.end());
+        stats.deletions_definitive_split++;
+        stats.split_side_total_size += (long long)touched.size();
+        if ((long long)touched.size() > stats.split_side_max_size) stats.split_side_max_size = (long long)touched.size();
+        cc.split(touched);
+    }
+
+    void fallback(const Search&) {
+        if (g_defer_fallback) { stats.deletions_fallback_deferred++; return; }
+        auto fb0 = chrono::high_resolution_clock::now();
+        vector<int> roots(cc.label.size());
+        full_recompute_cc_gpu(graph, roots, (int)roots.size());
+        cc.reset_from_roots(roots);
+        stats.fallback_ms += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - fb0).count();
+        stats.deletions_fallback++;
+    }
+};
 
 int main(int argc, char* argv[]) {
-    ScoutCliArgs args = parse_scout_cli(argc, argv, "cc"); // core/cli_setup.h
-    g_integrated = gpu_warmup_and_device_setup(args.gpu_id); // core/cli_setup.h
-    if (getenv("SCOUT_FORCE_COPY")) g_integrated = false;  // integrated GPU: use device buffers + copies instead of mapped host memory
+    ScoutCliArgs args = parse_scout_cli(argc, argv, "cc");
+    g_integrated = gpu_warmup_and_device_setup(args.gpu_id);
+    if (getenv("SCOUT_FORCE_COPY")) g_integrated = false;
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, args.gpu_id));
 
-    g_defer_fallback = read_defer_fallback_env(/*production_default=*/true); // core/local_repair.h
+    g_defer_fallback = read_defer_fallback_env(true);
     cout << (g_defer_fallback
              ? "[Deferred fallback: ON (default)] Inconclusive deletions deferred; resolved by ONE "
                "catch-up full recompute after all batches, instead of one call each."
@@ -463,11 +427,11 @@ int main(int argc, char* argv[]) {
     int num_nodes = graph.num_nodes;
 
     long long total_degree = 0;
-    total_degree = graph.base.edges;   // no updates applied yet: sum of degrees = stored edges
+    total_degree = graph.base.edges;
     double avg_degree = num_nodes > 0 ? (double)total_degree / num_nodes : 0.0;
-    g_use_exhaustive_search = (avg_degree < LOW_DEGREE_THRESHOLD); // kept only for the console message below
-    g_fallback_bound = make_fallback_bound(5000, LOW_DEGREE_THRESHOLD, avg_degree, (long long)num_nodes); // core/local_repair.h
-    print_run_header("cc", args.egr_path, num_nodes, total_degree, avg_degree, prop.name, g_integrated); // core/reporting.h
+    g_use_exhaustive_search = (avg_degree < LOW_DEGREE_THRESHOLD);
+    g_fallback_bound = make_fallback_bound(5000, LOW_DEGREE_THRESHOLD, avg_degree, (long long)num_nodes);
+    print_run_header("cc", args.egr_path, num_nodes, total_degree, avg_degree, prop.name, g_integrated);
     cout << (g_use_exhaustive_search ? "EXHAUSTIVE search mode (no cap)" : "CAPPED search mode (bound=5000)")
          << " (avg_degree=" << fixed << setprecision(2) << avg_degree << " vs threshold=" << LOW_DEGREE_THRESHOLD << ")" << endl;
 
@@ -476,7 +440,7 @@ int main(int argc, char* argv[]) {
     {
         vector<int> parent(num_nodes);
         for (int v = 0; v < num_nodes; v++) parent[v] = v;
-        vector<long long> vals = read_ints_fast(args.context_path); // core/cli_setup.h
+        vector<long long> vals = read_ints_fast(args.context_path);
         for (int idx = 0; idx < num_nodes && idx < (int)vals.size(); idx++) parent[idx] = (int)vals[idx];
         vector<int> roots(num_nodes);
         for (int v = 0; v < num_nodes; v++) roots[v] = find_root(parent, v);
@@ -487,28 +451,36 @@ int main(int argc, char* argv[]) {
     auto setup_t1 = chrono::high_resolution_clock::now();
     double setup_ms = chrono::duration<double, milli>(setup_t1 - setup_t0).count();
 
-    vector<filesystem::path> batch_paths = list_batch_files_sorted(args.batch_dir); // core/cli_setup.h
+    vector<filesystem::path> batch_paths = list_batch_files_sorted(args.batch_dir);
 
     Stats stats;
+    CcApp app{graph, cc, stats, Budget::from_env(g_fallback_bound)};
+    cout << "[NL driver] deletion budget: " << app.deletion_budget.describe()
+         << ", memo " << (graph.memo_on ? "on" : "off (SCOUT_NO_MEMO)") << endl;
     int processed = 0;
     for (const auto& path : batch_paths) {
         if (processed >= args.num_batches) break;
-        vector<EdgeUpdate> raw_batch = parse_batch_file(path, graph, num_nodes); // core/cli_setup.h
-        vector<Edit> batch;
+        vector<EdgeUpdate> raw_batch = parse_batch_file(path, graph, num_nodes);
+        vector<Update> batch;
         batch.reserve(raw_batch.size());
         for (const auto& e : raw_batch) batch.push_back({e.u, e.v, e.is_insertion});
         Stats before = stats;
-        double s0 = g_search_ms;
-        processBatch(batch, graph, cc, stats);
-        double this_batch_ms = stats.total_batch_ms - before.total_batch_ms;
-        print_batch_result(processed + 1, args.num_batches, (int)batch.size(), this_batch_ms, // core/reporting.h
+        FetchStats fs0 = g_fetch;
+        long long mf0 = process_major_faults();
+        auto bt0 = chrono::high_resolution_clock::now();
+        nl_process_batch(app, graph, batch);
+        double this_batch_ms = chrono::duration<double, milli>(chrono::high_resolution_clock::now() - bt0).count();
+        stats.total_batch_ms += this_batch_ms;
+        print_batch_result(processed + 1, args.num_batches, (int)batch.size(), this_batch_ms,
             {{"insertions", to_string(stats.insertions - before.insertions)},
              {"deletions", to_string(stats.deletions - before.deletions)},
              {"fallback", to_string(stats.deletions_fallback - before.deletions_fallback)}});
         {
-            // CPU-only per batch: fetch = bounded search (neighborhood reads), the rest is union/relabel.
-            double f = g_search_ms - s0;
-            print_stage_times(processed + 1, f, 0.0, 0.0, max(0.0, this_batch_ms - f), 0.0); // core/reporting.h
+
+            double f = g_fetch.ms - fs0.ms;
+            print_stage_times(processed + 1, f, 0.0, 0.0, max(0.0, this_batch_ms - f), 0.0);
+            print_fetch_stats(processed + 1, g_fetch.pages - fs0.pages, process_major_faults() - mf0, g_fetch.lists - fs0.lists,
+                              g_fetch.memo_hits - fs0.memo_hits);
         }
         processed++;
     }
@@ -528,6 +500,8 @@ int main(int argc, char* argv[]) {
 
     int num_components = cc.count_components();
 
+    cout << "Pages requested (Alg. 1): " << g_fetch.pages << " | lists reconciled: " << g_fetch.lists
+         << " | memo hits: " << g_fetch.memo_hits << endl;
     cout << "Insertions: " << stats.insertions << " (noop=" << stats.insertions_noop
          << ", merged=" << stats.insertions_merged << ")" << endl;
     cout << "Deletions:  " << stats.deletions << " (noop=" << stats.deletions_noop
@@ -540,13 +514,11 @@ int main(int argc, char* argv[]) {
 
     double processing_ms = stats.total_batch_ms + deferred_fallback_ms;
     double e2e_ms = setup_ms + processing_ms;
-    print_final_summary(setup_ms, processing_ms, e2e_ms, // core/reporting.h
+    print_final_summary(setup_ms, processing_ms, e2e_ms,
                          "components", initial_components,
                          "components", num_components);
 
-    // Results are printed; skip freeing pinned/mapped buffers and CUDA context teardown
-    // (the OS reclaims them), which otherwise adds seconds after the work is done.
-    if (!g_touched.empty()) dump_touched_at_exit();   // SCOUT_DUMP_TOUCHED: _Exit skips atexit handlers
+    if (!g_touched.empty()) dump_touched_at_exit();
     std::cout.flush();
     fflush(stdout);
     std::_Exit(0);

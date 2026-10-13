@@ -1,12 +1,5 @@
-// FlashGraph.h: storage-resident graph access for SCOUT.
-//
-// FlashGraph memory-maps a .egr CSR file read-only (MADV_RANDOM by default) so only the pages
-// that are touched become resident. DeltaOverlay keeps inserted/deleted edges per vertex in
-// memory, and HybridGraph combines the two: neighbors_into(v) returns the logical neighborhood
-// (base adjacency minus deletions plus insertions), with an optional batch-local memo.
-//
-// .egr format: int32 nodes, int32 edges (or -1 followed by uint64 edges for the wide format),
-// nindex[nodes+1] (int32, or int64 when wide), nlist[edges] (int32).
+// Storage-resident graph: the .egr CSR is mmap'd read-only; updates live in an in-memory
+// scratchpad and are merged into a vertex's neighbor list on demand.
 
 #ifndef FLASH_GRAPH_H
 #define FLASH_GRAPH_H
@@ -19,6 +12,7 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include <unordered_set>
 #include <algorithm>
 
@@ -29,9 +23,7 @@
 
 typedef unsigned long long ull;
 
-// ---------------------------------------------------------------------------
-// FlashGraph: read-only, mmap-backed access to a .egr CSR file.
-// ---------------------------------------------------------------------------
+// Read-only view of the .egr file. Pages become resident only when touched.
 class FlashGraph {
 public:
     int nodes = 0;
@@ -48,11 +40,7 @@ public:
         adopt(m);
     }
 
-    // Build the new mapping first, THEN swap pointers, THEN unmap the old
-    // one — safe under POSIX semantics because unlink/rename doesn't
-    // invalidate an fd/mmap that's still open on the old inode, so any
-    // in-flight reader using the old pointers keeps working correctly
-    // right up until this function returns.
+    // Swap to a new file: map it first, then unmap the old one.
     void remap(const char* new_fname) {
         Mapping m = map_file(new_fname);
         int old_fd = fd;
@@ -82,6 +70,25 @@ public:
         return nlist_ptr + nindex_at(v + 1);
     }
 
+    // Page-level view used by the fetch engine (core/fetch.h).
+    inline size_t page_bytes() const { return page_size; }
+    inline size_t offset_entry_byte(int v) const {
+        return nindex_byte_offset + (size_t)v * (wide_nindex ? sizeof(ull) : sizeof(int32_t));
+    }
+    inline size_t offset_entry_width() const { return wide_nindex ? sizeof(ull) : sizeof(int32_t); }
+    inline size_t list_byte_begin(int v) const { return nlist_byte_offset + (size_t)nindex_at(v) * sizeof(int); }
+    inline size_t list_byte_end(int v) const { return nlist_byte_offset + (size_t)nindex_at(v + 1) * sizeof(int); }
+
+    inline bool resident(size_t first, size_t count, unsigned char* vec) const {
+        if ((first + count) * page_size > file_size)
+            count = (file_size + page_size - 1) / page_size - first;
+        return mincore((char*)map_base + first * page_size, count * page_size, vec) == 0;
+    }
+    inline void touch_page(size_t page) const {
+        size_t off = page * page_size;
+        if (off < file_size) (void)*(volatile const char*)((const char*)map_base + off);
+    }
+
 private:
     int fd = -1;
     void* map_base = nullptr;
@@ -91,6 +98,7 @@ private:
     size_t nlist_byte_offset = 0;
     const char* nindex_ptr = nullptr;
     const int* nlist_ptr = nullptr;
+    size_t page_size = 4096;
 
     struct Mapping {
         int fd;
@@ -114,6 +122,8 @@ private:
         nlist_byte_offset = m.nlist_byte_offset;
         nindex_ptr = (const char*)map_base + nindex_byte_offset;
         nlist_ptr = (const int*)((const char*)map_base + nlist_byte_offset);
+        long ps = sysconf(_SC_PAGESIZE);
+        page_size = ps > 0 ? (size_t)ps : 4096;
     }
 
     void close_mapping() {
@@ -124,9 +134,6 @@ private:
         file_size = 0;
     }
 
-    // Mirrors readECLgraph()'s header parsing (ECLgraph.h) but stops after
-    // the header — never reads nindex/nlist into RAM, only computes their
-    // byte offsets so they can be mmap'd instead.
     static Mapping map_file(const char* fname) {
         FILE* f = fopen(fname, "rb");
         if (!f) { fprintf(stderr, "ERROR: FlashGraph could not open %s\n", fname); exit(1); }
@@ -174,8 +181,8 @@ private:
         if (mapped == MAP_FAILED) {
             fprintf(stderr, "ERROR: mmap failed for %s\n", fname); exit(1);
         }
-        // 2-hop BFS access is scattered, not sequential — suppress readahead.
-        // SCOUT_NO_MADV_RANDOM (evaluation ablation) keeps the kernel's default readahead.
+
+        // Accesses are scattered, so readahead would only load unneeded pages.
         if (!std::getenv("SCOUT_NO_MADV_RANDOM")) madvise(mapped, sz, MADV_RANDOM);
 
         Mapping m;
@@ -192,20 +199,13 @@ private:
     }
 };
 
-// ---------------------------------------------------------------------------
-// DeltaOverlay: in-memory edges inserted/removed since the base .egr was
-// written. Never touches disk — the base file is only rewritten by the
-// end-of-cycle compaction step (tools/flash_compactor.h).
-// ---------------------------------------------------------------------------
+// Update scratchpad: inserted and deleted neighbors per vertex.
 class DeltaOverlay {
 public:
     std::unordered_map<int, std::vector<int>> added_adj;
     std::unordered_map<int, std::unordered_set<int>> removed_adj;
     long long delta_edge_count = 0;
 
-    // Returns whether the delta has a definitive opinion on (u,v)'s
-    // adjacency; if not (definitive=false), caller must fall through to
-    // the base graph.
     bool isAdjacentDelta(int u, int v, bool& definitive) const {
         auto ait = added_adj.find(u);
         if (ait != added_adj.end()) {
@@ -242,7 +242,7 @@ public:
         delta_edge_count++;
     }
 
-    // Merges base.neighbors(v) (minus tombstones) with added_adj[v] into out.
+    // Current neighbors: base list minus deleted neighbors, plus inserted ones.
     void neighbors_into(int v, const FlashGraph& base, std::vector<int>& out) const {
         out.clear();
         const int* b = base.neighbors_begin(v);
@@ -280,7 +280,7 @@ public:
     }
 
 private:
-    // If (u,v) was a tombstoned base edge, un-tombstone it and return true.
+
     bool un_tombstone(int u, int v) {
         auto rit_u = removed_adj.find(u);
         if (rit_u == removed_adj.end() || !rit_u->second.count(v)) return false;
@@ -290,8 +290,6 @@ private:
         return true;
     }
 
-    // If (u,v) was a delta-only edge (never touched base), forget it and
-    // return true.
     bool forget_delta_edge(int u, int v) {
         auto ait_u = added_adj.find(u);
         if (ait_u == added_adj.end()) return false;
@@ -310,14 +308,7 @@ private:
     }
 };
 
-// ---------------------------------------------------------------------------
-// HybridGraph: base FlashGraph + DeltaOverlay, exposing the same call shape
-// the existing in-RAM Graph class used (isAdjacent/insertEdge/removeEdge),
-// plus neighbors_into/degree for the 2-hop BFS fetch path.
-// ---------------------------------------------------------------------------
-// SCOUT_DUMP_TOUCHED=<path> (evaluation, experiment 3b): records every vertex
-// whose adjacency list is fetched, and writes them as int32 at exit, so the
-// Eq. (4) page bound can be computed for the run. Off by default.
+// SCOUT_DUMP_TOUCHED: writes the ids of all fetched vertices at exit.
 inline std::vector<char> g_touched;
 inline std::string g_touched_path;
 inline void dump_touched_at_exit() {
@@ -328,19 +319,29 @@ inline void dump_touched_at_exit() {
     fclose(f);
 }
 
+// Base graph + scratchpad + a batch-local memo of fetched lists (sharded, so the parallel
+// merge step does not serialize on one lock).
 class HybridGraph {
 public:
-    // Batch-local memo of reconciled adjacency lists (the memo of Alg. 1). Cleared at the start of
-    // each batch, invalidated for both endpoints of every edge change. SCOUT_NO_MEMO disables it.
-    mutable std::unordered_map<int, std::vector<int>> memo;
-    mutable std::mutex memo_mu;
-    bool memo_on = false;   // enabled by GC/BFS/CC via enable_memo(); MIS keeps its own hop-1 reuse
-    void enable_memo() { memo_on = (std::getenv("SCOUT_NO_MEMO") == nullptr); }
-    void memo_clear() { std::lock_guard<std::mutex> g(memo_mu); memo.clear(); }
+
+    static constexpr int MEMO_SHARDS = 64;
+    struct MemoShard {
+        std::mutex mu;
+        std::unordered_map<int, std::vector<int>> map;
+    };
+    mutable MemoShard memo_shards[MEMO_SHARDS];
+    mutable std::atomic<long long> memo_bytes{0};
+    long long memo_max_bytes = 0;
+    bool memo_on = false;
     FlashGraph base;
     DeltaOverlay delta;
     int num_nodes = 0;
     std::string flash_path;
+
+    void enable_memo() {
+        memo_on = (std::getenv("SCOUT_NO_MEMO") == nullptr);
+        if (const char* m = std::getenv("SCOUT_MEMO_MAX_BYTES")) memo_max_bytes = std::atoll(m);
+    }
 
     void open(const char* fname) {
         base.open(fname);
@@ -365,26 +366,59 @@ public:
         return false;
     }
 
+    MemoShard& shard_of(int v) const { return memo_shards[(unsigned)v % MEMO_SHARDS]; }
+
+    const std::vector<int>* memo_find(int v) const {
+        MemoShard& sh = shard_of(v);
+        std::lock_guard<std::mutex> g(sh.mu);
+        auto it = sh.map.find(v);
+        return it == sh.map.end() ? nullptr : &it->second;
+    }
+    const std::vector<int>* memo_put(int v, std::vector<int>&& list) const {
+        MemoShard& sh = shard_of(v);
+        std::lock_guard<std::mutex> g(sh.mu);
+        auto res = sh.map.emplace(v, std::move(list));
+        if (res.second) memo_bytes += (long long)res.first->second.size() * (long long)sizeof(int);
+        return &res.first->second;
+    }
+    void memo_clear() {
+        for (auto& sh : memo_shards) { std::lock_guard<std::mutex> g(sh.mu); sh.map.clear(); }
+        memo_bytes = 0;
+    }
+    bool memo_over_budget() const { return memo_max_bytes > 0 && memo_bytes.load() > memo_max_bytes; }
+    void memo_erase(int v) {
+        MemoShard& sh = shard_of(v);
+        std::lock_guard<std::mutex> g(sh.mu);
+        auto it = sh.map.find(v);
+        if (it != sh.map.end()) {
+            memo_bytes -= (long long)it->second.size() * (long long)sizeof(int);
+            sh.map.erase(it);
+        }
+    }
+    // An edge change makes both endpoints' memoized lists stale.
     void memo_invalidate(int u, int v) {
         if (!memo_on) return;
-        std::lock_guard<std::mutex> g(memo_mu);
-        memo.erase(u); memo.erase(v);
+        memo_erase(u); memo_erase(v);
     }
+
     void insertEdge(int u, int v) { delta.insertEdge(u, v); memo_invalidate(u, v); }
     void removeEdge(int u, int v) { delta.removeEdge(u, v); memo_invalidate(u, v); }
 
+    // Bypasses the memo: used by the fetch engine and by full sequential passes.
+    void neighbors_direct(int v, std::vector<int>& out) const {
+        if (!g_touched.empty()) g_touched[v] = 1;
+        delta.neighbors_into(v, base, out);
+    }
+
     void neighbors_into(int v, std::vector<int>& out) const {
         if (memo_on) {
-            std::lock_guard<std::mutex> g(memo_mu);
-            auto it = memo.find(v);
-            if (it != memo.end()) { out = it->second; return; }
+            if (const std::vector<int>* m = memo_find(v)) { out = *m; return; }
         }
-        if (!g_touched.empty()) g_touched[v] = 1;   // benign race: every writer stores 1
-        delta.neighbors_into(v, base, out);
-        if (memo_on) { std::lock_guard<std::mutex> g(memo_mu); memo.emplace(v, out); }
+        neighbors_direct(v, out);
+        if (memo_on) memo_put(v, std::vector<int>(out));
     }
 
     int degree(int v) const { return delta.degree(v, base); }
 };
 
-#endif // FLASH_GRAPH_H
+#endif

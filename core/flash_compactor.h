@@ -1,5 +1,4 @@
-// flash_compactor.h: merges a FlashGraph base and its DeltaOverlay into a new .egr file
-// (scratchpad compaction), run outside the per-batch update path.
+// Merges the base graph and the scratchpad into a fresh .egr (MIS end-of-run compaction).
 
 #ifndef FLASH_COMPACTOR_H
 #define FLASH_COMPACTOR_H
@@ -15,18 +14,9 @@
 
 #include "FlashGraph.h"
 
-// Native C++ port of tools/efficient_converter.py's two-pass streaming
-// approach (Pass 1: degree cumsum -> nindex; Pass 2: stream nlist), but
-// merging base .egr + delta instead of a raw .mtx. Chosen over reusing
-// the Python script because this needs to run in-process, without
-// forking an interpreter, on every cycle's finalization.
 inline void compact_flash_graph(const FlashGraph& base, const DeltaOverlay& delta, const std::string& out_path) {
     const int nodes = base.nodes;
 
-    // ---- Pass 1: degree merge -> new_nindex (always written as the
-    // 64-bit sentinel format, regardless of the input's original width —
-    // simpler than tracking format across repeated compactions, and both
-    // readECLgraph() and FlashGraph already support it). ----
     std::vector<ull> new_nindex((size_t)nodes + 1);
     new_nindex[0] = 0;
     for (int v = 0; v < nodes; v++) {
@@ -58,8 +48,6 @@ inline void compact_flash_graph(const FlashGraph& base, const DeltaOverlay& delt
         fprintf(stderr, "ERROR: flash_compactor failed to write nindex to %s\n", tmp_path.c_str()); exit(1);
     }
 
-    // ---- Pass 2: nlist merge, streamed vertex-by-vertex straight to
-    // disk — never materializes the full merged neighbor list in RAM. ----
     std::vector<int> row_buf;
     for (int v = 0; v < nodes; v++) {
         row_buf.clear();
@@ -98,16 +86,11 @@ inline void compact_flash_graph(const FlashGraph& base, const DeltaOverlay& delt
     if (fsync(fileno(out)) != 0) { fprintf(stderr, "ERROR: flash_compactor fsync failed on %s\n", tmp_path.c_str()); exit(1); }
     fclose(out);
 
-    // ---- Atomic replace: never expose a half-written file at the
-    // canonical path. rename() is atomic within the same filesystem. ----
     if (rename(tmp_path.c_str(), out_path.c_str()) != 0) {
         fprintf(stderr, "ERROR: flash_compactor rename(%s -> %s) failed\n", tmp_path.c_str(), out_path.c_str());
         exit(1);
     }
 
-    // fsync the containing directory too, for durability against a crash
-    // immediately after the rename (the rename's atomicity w.r.t.
-    // visibility doesn't need this; power-loss durability does).
     std::string dir_path = ".";
     size_t slash = out_path.find_last_of('/');
     if (slash != std::string::npos) dir_path = out_path.substr(0, slash);
@@ -118,4 +101,4 @@ inline void compact_flash_graph(const FlashGraph& base, const DeltaOverlay& delt
     }
 }
 
-#endif // FLASH_COMPACTOR_H
+#endif
